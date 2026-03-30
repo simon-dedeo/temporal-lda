@@ -1,0 +1,18 @@
+# Compiled binary
+temporal_lda
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.out
+*.toc
+
+# OS junk
+.DS_Store
+
+# IDE
+.ruby-lsp/
+.vscode/

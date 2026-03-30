@@ -1,0 +1,4 @@
+num_documents=550
+vocab_size=18
+year_min=1850
+year_max=1950

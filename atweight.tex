@@ -1,0 +1,605 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{Temporal LDA: Density-Weighted Topic Model}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Standard topic models treat all documents equally, causing topics from sparse temporal periods to be overwhelmed by dense periods.
+We present a density-weighted variant of Latent Dirichlet Allocation (\textbf{Temporal LDA}) that uses Gaussian kernel density estimation on word mass to compute an inverse-density weight for each document.
+The key design is asymmetric: document-topic counts remain unweighted (preserving realistic document composition), while topic-word counts are weighted (equalizing the contribution of sparse and dense periods to learned vocabularies).
+Using collapsed Gibbs sampling on synthetic corpora with 1:20 document imbalance, we show that weighting recovers all six ground-truth topics where standard LDA collapses the sparse era into a single blob.
+With fewer topics than ground truth ($K=4$), the weighted model splits its budget symmetrically (2~sparse + 2~dense) while standard LDA devotes 3 of 4~topics to the dense era.
+\end{abstract}
+
+%% ===================================================================
+\section{Problem: Temporal Imbalance in Topic Models}
+%% ===================================================================
+
+In historical document collections the number of available sources varies dramatically across time.
+A corpus might contain 50 documents from a sparsely documented era and 500 from a densely documented one---a 1:10 imbalance in both document count and total word mass.
+
+Standard LDA maximises the joint likelihood over all tokens equally:
+\[
+\log P(\mathbf w) = \sum_{d=1}^{D} \sum_{n=1}^{N_d} \log P(w_{d,n} \mid \theta_d, \boldsymbol\beta)
+\]
+Because the 800-document period contributes ten times as many tokens, the model learns topic-word distributions that explain the dense period well while collapsing or ignoring themes unique to the sparse period.
+
+%% ===================================================================
+\section{Density Weighting}
+%% ===================================================================
+
+We weight each document inversely by the local temporal density of word mass around its year.
+
+\paragraph{Gaussian kernel.}
+Define a centred Gaussian kernel with bandwidth~$\sigma$ (in years):
+\[
+K(t) = \exp\!\left( -\frac{t^2}{2\sigma^2} \right)
+\]
+
+\paragraph{Word-mass density.}
+For each document~$d$ at year~$t_d$ with word count~$\ell_d$:
+\[
+\rho(t_d)
+  = \frac{\displaystyle\sum_{d'=1}^{D} \ell_{d'}\, K(t_{d'} - t_d)}
+         {\displaystyle\left(\sum_{d'=1}^{D} \ell_{d'}\right)
+          \cdot \sum_{t=y_{\min}}^{y_{\max}} K(t - t_d)}
+\]
+
+The \textbf{density weight} is the inverse of~$\rho$, normalised so the mean weight across documents equals~1:
+\[
+\widetilde w_d = \frac{1}{\rho(t_d)},
+\qquad
+w_d = \frac{\widetilde w_d}{\frac{1}{D}\sum_{d'}\widetilde w_{d'}}
+\]
+
+On the 50/500 test data with $\sigma=10$, sparse-era documents receive $w_d \approx 7.3$ and dense-era documents receive $w_d \approx 0.37$.
+
+%% ===================================================================
+\section{Generative Model}
+%% ===================================================================
+
+The generative model is LDA with a symmetric topic-word prior and an asymmetric, time-dependent document-topic prior:
+\[
+\begin{aligned}
+\boldsymbol\beta_k &\sim \operatorname{Dir}(\beta) &&\text{for } k = 1,\ldots,K \\
+\boldsymbol\theta_d &\sim \operatorname{Dir}\!\bigl(\alpha_1(y_d),\ldots,\alpha_K(y_d)\bigr) &&\text{for } d = 1,\ldots,D \\
+z_{d,n} &\sim \operatorname{Cat}(\boldsymbol\theta_d) \\
+w_{d,n} &\sim \operatorname{Cat}(\boldsymbol\beta_{z_{d,n}})
+\end{aligned}
+\]
+where $\boldsymbol\alpha(y) = (\alpha_1(y),\ldots,\alpha_K(y))$ is a per-topic document-topic prior that varies with year~$y$, and $\beta$ is a scalar topic-word prior.
+The per-topic structure lets the model learn which topics are active in each era (inactive topics receive $\alpha_k \approx 0$), while the temporal dependence lets the concentration vary across time.
+The density weight enters only during inference, not in the generative process.
+
+%% ===================================================================
+\section{Collapsed Gibbs Sampling with Asymmetric Weighting}
+%% ===================================================================
+
+We use collapsed Gibbs sampling, integrating out~$\boldsymbol\theta$ and~$\boldsymbol\beta$ to work directly with sufficient-statistic counts.
+
+\subsection{Asymmetric Count Bookkeeping}
+
+Three count arrays are maintained:
+\begin{itemize}
+\item $n_{d,k}$\;---\;tokens in document~$d$ assigned to topic~$k$ \textbf{(unweighted, $\pm\,1$)}
+\item $n_{k,v}$\;---\;occurrences of word~$v$ in topic~$k$ \textbf{(weighted, $\pm\,w_d$)}
+\item $n_{k}$\;---\;total tokens in topic~$k$ \textbf{(weighted, $\pm\,w_d$)}
+\end{itemize}
+When a token is removed or added during sampling, $n_{d,k}$ changes by~$1$ while $n_{k,v}$ and~$n_k$ change by~$w_d$.
+
+\subsection{Sampling Equation}
+
+For each token~$(d,n)$ with current assignment~$z_{d,n}$:
+
+\begin{enumerate}
+\item \textbf{Remove} the token from all three count arrays.
+\item \textbf{Sample} a new topic from
+\[
+P(z_{d,n} = k \mid \mathbf z^{-(d,n)}, \mathbf w)
+  \;\propto\;
+  \bigl(n_{d,k}^{-(d,n)} + \alpha_k(y_d)\bigr)
+  \;\cdot\;
+  \frac{n_{k,v}^{-(d,n)} + \beta}
+       {n_{k}^{-(d,n)} + \beta\,V}
+\]
+where $V$ is the vocabulary size and $\alpha_k(y_d)$ is the per-topic prior for the document's year.
+\item \textbf{Add} the token back under the newly sampled topic.
+\end{enumerate}
+
+\subsection{Why Asymmetric Weighting}
+
+\begin{enumerate}
+\item \textbf{Preserves document composition.}
+Unweighted~$n_{d,k}$ means each document's topic mixture~$\theta_d$ reflects its actual word content, not an inflated count.
+
+\item \textbf{Balances vocabulary learning.}
+Weighted~$n_{k,v}$ gives sparse-period documents a larger per-token influence on learned topic-word distributions, counteracting the raw imbalance in token counts.
+\end{enumerate}
+
+%% ===================================================================
+\section{Bayesian Interpretation}
+%% ===================================================================
+
+The weighting scheme has a precise interpretation in terms of the posterior over topic-word distributions.
+This section makes the connection explicit.
+
+\subsection{Standard Collapsed Gibbs and Sufficient Statistics}
+
+In standard collapsed LDA the topic-word distributions~$\boldsymbol\beta_k$ are integrated out analytically.
+Conditioned on topic assignments~$\mathbf z$, the posterior over~$\boldsymbol\beta_k$ is Dirichlet:
+\[
+\boldsymbol\beta_k \mid \mathbf z, \mathbf w
+  \;\sim\;
+  \operatorname{Dir}\!\bigl(\beta + n_{k,1},\;\ldots,\;\beta + n_{k,V}\bigr)
+\]
+where $n_{k,v} = \#\{(d,n) : z_{d,n}=k,\; w_{d,n}=v\}$ is the unweighted count of word~$v$ assigned to topic~$k$.
+Every token contributes equally: one unit to the count of its word in its topic.
+
+\subsection{What Weighting Changes}
+
+In our scheme a token from document~$d$ contributes $w_d$ instead of~$1$ to the topic-word counts:
+\[
+\tilde n_{k,v}
+  = \sum_{\substack{(d,n):\\z_{d,n}=k,\;w_{d,n}=v}} w_d
+\]
+
+If we substitute~$\tilde n_{k,v}$ into the Dirichlet posterior we get
+\[
+\boldsymbol\beta_k \mid \mathbf z, \mathbf w
+  \;\sim\;
+  \operatorname{Dir}\!\bigl(\beta + \tilde n_{k,1},\;\ldots,\;\beta + \tilde n_{k,V}\bigr)
+\]
+Dirichlet parameters need not be integers, so this remains a well-defined distribution.
+The point estimate used in the code (the posterior mean) is
+\[
+\hat\beta_{k,v}
+  = \frac{\tilde n_{k,v} + \beta}{\tilde n_k + \beta\,V}
+\]
+which is exactly the formula in the output routine.
+
+\subsection{Interpretation: Fractional Observations}
+
+The Dirichlet-Multinomial conjugate update treats each count unit as one observation of a word.
+By adding~$w_d$ instead of~$1$, we are telling the model that a token from a sparse period is worth~$w_d$ observations (e.g.\ $7.3$ for sparse-era documents) while a token from a dense period is worth only~$w_d \approx 0.37$ observations.
+
+This is equivalent to \textbf{importance weighting} on the sufficient statistics: each real token is reweighted so that the effective corpus seen by the topic-word posterior is temporally balanced.
+
+\subsection{What Is \emph{Not} Reweighted}
+
+Document-topic counts~$n_{d,k}$ remain unweighted.
+The posterior over each document's topic mixture is therefore
+\[
+\boldsymbol\theta_d \mid \mathbf z
+  \;\sim\;
+  \operatorname{Dir}\!\bigl(\alpha_1(y_d) + n_{d,1},\;\ldots,\;\alpha_K(y_d) + n_{d,K}\bigr)
+\]
+with the true integer counts and the per-topic prior for the document's year.
+This means $\theta_d$ reflects the document's actual topic proportions, not an inflated version.
+The asymmetry is deliberate: we want to correct the \emph{global} vocabulary posteriors for temporal imbalance while leaving \emph{per-document} composition estimates truthful.
+
+\subsection{Effect on the Gibbs Conditional}
+
+The Gibbs sampling equation
+\[
+P(z_{d,n} = k) \;\propto\;
+  \underbrace{\bigl(n_{d,k}^{-(d,n)} + \alpha_k(y_d)\bigr)}_{\text{unweighted}}
+  \;\cdot\;
+  \underbrace{\frac{\tilde n_{k,v}^{-(d,n)} + \beta}{\tilde n_k^{-(d,n)} + \beta\,V}}_{\text{weighted}}
+\]
+involves the product of an unweighted document-topic term and a weighted topic-word term.
+The document-topic term pulls the token toward topics already present in the document (a local signal).
+The topic-word term evaluates how well each topic explains this particular word given the rebalanced global vocabulary---a global signal in which sparse-period words carry amplified influence.
+
+During burn-in this drives the sampler toward configurations where topic-word distributions are shaped equally by both periods, while each document's internal mixture remains faithful to its own content.
+
+%% ===================================================================
+\section{What the Weighting Equalises (and What It Does Not)}
+%% ===================================================================
+
+\subsection{Claim: Uniform Effective Word Mass}
+
+The weighting has a single provable consequence:
+\emph{the weighted word mass per unit time is approximately constant across the timeline.}
+That is, every year exerts equal influence on the topic-word sufficient statistics, regardless of how many documents survive from that year.
+
+\subsection{Sketch of Proof}
+
+Define the \textbf{unnormalised word-mass density} at continuous time~$y$:
+\[
+\hat\rho(y) = \sum_{d=1}^{D} \ell_d \, K_\sigma(y - y_d)
+\]
+This is the kernel-smoothed total word mass at~$y$.
+The weight of each document is $w_d \propto 1/\hat\rho(y_d)$ (with a subsequent normalisation so that $\bar w = 1$).
+
+Now consider the \textbf{weighted word-mass density}---the effective word mass at~$y$ after reweighting:
+\[
+\hat\rho_w(y)
+  = \sum_{d=1}^{D} \ell_d \, w_d \, K_\sigma(y - y_d)
+  \;\propto\; \sum_{d=1}^{D} \frac{\ell_d}{\hat\rho(y_d)}\, K_\sigma(y - y_d)
+\]
+
+Because $\hat\rho$ is itself a kernel smooth with bandwidth~$\sigma$, it varies slowly on the scale of~$\sigma$.
+For the documents that contribute non-negligibly to the sum at~$y$ (those with $|y_d - y| \lesssim \sigma$), we have $\hat\rho(y_d) \approx \hat\rho(y)$, so
+\[
+\hat\rho_w(y)
+  \;\approx\; \frac{1}{\hat\rho(y)} \sum_{d=1}^{D} \ell_d \, K_\sigma(y - y_d)
+  \;=\; \frac{\hat\rho(y)}{\hat\rho(y)}
+  \;=\; 1
+\]
+
+The approximation is exact in the limit $\sigma \to \infty$ (where $\hat\rho$ becomes constant) and remains tight whenever the density varies smoothly relative to~$\sigma$.
+In practice the Gaussian kernel's rapid decay makes the approximation excellent for any corpus where the year distribution does not have sharp discontinuities narrower than~$\sigma$.
+
+\subsection{Consequence for Topic Estimation}
+
+After the sampler converges, the weighted topic-word counts are
+\[
+\tilde n_{k,v}
+  = \sum_{\substack{(d,n):\\z_{d,n}=k,\;w_{d,n}=v}} w_d
+\]
+The total weighted count that topic~$k$ accumulates from documents near year~$y$ is proportional to the weighted word mass from that year multiplied by the fraction of that mass assigned to~$k$.
+Because $\hat\rho_w(y) \approx 1$, \textbf{each year contributes approximately equal effective word mass to every topic-word posterior},
+with the cross-year variation determined only by how much each year actually uses topic~$k$, not by how many documents happen to survive from that year.
+
+\subsection{What This Does \emph{Not} Guarantee}
+
+The weighting equalises \emph{influence}, not \emph{fit}.
+It does not follow that the model explains every word equally well across time.
+If the true vocabulary genuinely differs between periods---which it does; that is the entire reason distinct topics exist---then the per-token log-likelihood will still vary by era.
+Two kinds of variation remain:
+
+\begin{enumerate}
+\item \textbf{Topical variation.}
+  A word that belongs to a well-separated era-specific topic will be explained well in its own period and poorly outside it.
+  This is correct behaviour, not a defect.
+
+\item \textbf{Model capacity.}
+  If $K$ is too small to represent all true themes, the model must merge topics.
+  Which topics get merged depends on the data, and weighting ensures the merge is not biased toward the dense period---but some loss of fit is inevitable wherever merging occurs.
+\end{enumerate}
+
+The precise guarantee is: \emph{the topics are estimated as if the corpus had uniform temporal coverage.}
+Dense periods cannot dominate the topic-word distributions; sparse periods cannot be drowned out.
+The compromise the model makes when fitting a single set of~$K$ topics is balanced across time, rather than skewed toward whichever era contributes more tokens.
+
+%% ===================================================================
+\section{Implementation}
+%% ===================================================================
+
+\subsection{Input Files}
+
+\textbf{documents.txt}\;---\;one line per document:
+\begin{verbatim}
+year  length  word_id_1  word_id_2  ...
+\end{verbatim}
+
+\textbf{vocab.txt}\;---\;one word per line, ordered by word ID.
+
+\textbf{metadata.txt}\;---\;corpus facts (read by the program):
+\begin{verbatim}
+num_documents=550
+vocab_size=18
+year_min=1850
+year_max=1950
+\end{verbatim}
+
+\subsection{Compilation and CLI}
+
+\begin{verbatim}
+make
+
+./temporal_lda --docs documents.txt \
+               --vocab vocab.txt    \
+               --metadata metadata.txt \
+               --output results/    \
+               --K 4 --iterations 1000 --seed 99 \
+               --alpha 1.0 --beta 1.0 --sigma 50.0 \
+               --optimize-interval 50 --converge 1e-6
+\end{verbatim}
+
+Pass \texttt{--no-weighting} to run standard (unweighted) LDA.
+Pass \texttt{--converge $\epsilon$} to stop early once the log-likelihood stabilises (\texttt{--iterations} becomes the upper bound).
+Pass \texttt{--optimize-interval $N$} to re-estimate $\alpha$ and $\beta$ every $N$~Gibbs iterations using Minka's fixed-point update (see below).
+Pass \texttt{--local-alpha FILE} to enable time-dependent $\boldsymbol\alpha(y)$ and write the per-year vectors to \texttt{FILE}; without this flag $\boldsymbol\alpha$ is a single global vector (the same asymmetric prior at every year).
+All model parameters ($K$, $\alpha$, $\beta$, $\sigma$, seed, iterations) are set via CLI flags; the metadata file supplies only corpus dimensions.
+
+\subsection{Hyperparameter Optimisation}
+
+When \texttt{--optimize-interval $N$} is set, the sampler periodically re-estimates $\boldsymbol\alpha$ and $\beta$ using Minka's fixed-point iteration for asymmetric Dirichlet priors.
+
+\paragraph{Asymmetric Minka update.}
+The sampler maintains a $K$-vector $\boldsymbol\alpha(y) = (\alpha_1(y),\ldots,\alpha_K(y))$ for each year~$y$.
+The update uses a shared denominator across all topics and a per-topic numerator:
+\[
+\alpha_k(y)^{\text{new}}
+  = \alpha_k(y)\;
+    \frac{\displaystyle\sum_{d=1}^{D} K_\sigma(t_d - y)\,
+          \bigl[\psi(n_{d,k}+\alpha_k(y))-\psi(\alpha_k(y))\bigr]}
+         {\displaystyle\sum_{d=1}^{D} K_\sigma(t_d - y)\,
+          \bigl[\psi(N_d+\alpha_{\Sigma}(y))-\psi(\alpha_{\Sigma}(y))\bigr]}
+\]
+where $\alpha_{\Sigma}(y) = \sum_{k=1}^K \alpha_k(y)$ is the concentration,
+$N_d = \sum_k n_{d,k}$ is the document length,
+and $K_\sigma(t) = \exp(-t^2/2\sigma^2)$ is the same Gaussian kernel used for density weighting.
+
+The per-topic structure lets the estimator push inactive topics toward $\alpha_k \approx 0$ while active topics converge to their true Dirichlet concentration.
+The shared denominator couples the topics through the total document length, enforcing the constraint that the concentration sum~$\alpha_\Sigma$ must explain the overall sparsity of document-topic mixtures.
+
+\paragraph{Local vs.\ global mode.}
+When \texttt{--local-alpha} is passed, each year~$y$ maintains its own $K$-vector~$\boldsymbol\alpha(y)$, kernel-weighted by temporal proximity as above.
+Without \texttt{--local-alpha}, a single global $K$-vector is estimated (using all documents with flat weighting) and broadcast to all years.
+
+The kernel bandwidth~$\sigma$ controls the locality of the local estimate:
+\begin{itemize}
+\item $\sigma \to \infty$: the kernel is flat, recovering the global mode.
+\item $\sigma \to 0$: each year's $\boldsymbol\alpha$ depends only on documents from that exact year.
+\end{itemize}
+
+\paragraph{Global $\beta$.}
+The topic-word prior $\beta$ is updated with the standard (global) Minka iteration:
+\[
+\beta^{\text{new}}
+  = \beta \;\frac{\displaystyle\sum_{k=1}^{K}\sum_{v=1}^{V}
+      \bigl[\psi(\tilde n_{k,v}+\beta)-\psi(\beta)\bigr]}
+     {\displaystyle V\sum_{k=1}^{K}
+      \bigl[\psi(\tilde n_{k}+V\beta)-\psi(V\beta)\bigr]}
+\]
+using the weighted topic-word counts $\tilde n_{k,v}$ and totals $\tilde n_k$.
+
+Five inner fixed-point steps are applied per optimisation round; a 50-iteration burn-in precedes the first round.
+In practice $\alpha(y)$ and $\beta$ converge from their initial values (typically~1.0) to stable values within ${\sim}200$ Gibbs iterations.
+
+\subsection{Convergence Detection}
+
+The \texttt{--converge $\epsilon$} flag enables window-mean convergence detection.
+The sampler maintains two consecutive windows of 10~log-likelihood samples, each spanning 100~Gibbs iterations.
+After both windows are full, convergence is declared when
+\[
+\frac{\lvert\bar L_{\text{curr}} - \bar L_{\text{prev}}\rvert}{\lvert\bar L_{\text{curr}}\rvert}
+  < \epsilon
+\]
+where $\bar L$ denotes the window mean.
+This smooths out MCMC noise while remaining sensitive to genuine drift in the likelihood surface.
+
+\subsection{Output Files}
+
+\begin{itemize}
+\item \texttt{beta.txt}\;---\;topic-word distributions: \texttt{topic word prob} per line.
+\item \texttt{theta.txt}\;---\;document-topic distributions: \texttt{doc topic prob} per line.
+\item \texttt{weights.txt}\;---\;per-document weights: \texttt{doc year length weight} per line.
+\item \texttt{alpha.txt}\;---\;per-year document-topic prior: \texttt{year $\alpha_1$ $\alpha_2$ \ldots\ $\alpha_K$} per line
+  ($K$~columns; only with \texttt{--local-alpha}; filename is user-specified).
+\end{itemize}
+
+%% ===================================================================
+\appendix
+\section{Validation Experiment}
+%% ===================================================================
+
+We validate on a synthetic corpus generated by \texttt{gen\_test.rb}.
+The corpus has two time points---a sparse era and a dense era---with a 1:20 imbalance in total word mass, heterogeneous document-topic sparsity, and six ground-truth topics whose vocabularies are completely disjoint.
+
+\subsection{Data}
+
+Six true topics, each defined by three exclusive words from a vocabulary of 18~symbols:
+
+\begin{center}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Topic} & \textbf{Words} & \textbf{Era} \\
+\midrule
+T1 & \texttt{a b c} & 1850 (sparse) \\
+T2 & \texttt{d e f} & 1850 (sparse) \\
+T3 & \texttt{g h i} & 1850 (sparse) \\
+T4 & \texttt{A B C} & 1950 (dense)  \\
+T5 & \texttt{D E F} & 1950 (dense)  \\
+T6 & \texttt{G H I} & 1950 (dense)  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+\item \textbf{1850 (sparse):} 50~documents of length 100.  Each document draws a topic mixture from $\operatorname{Dir}(0.1, 0.1, 0.1)$ over T1, T2, T3.
+\item \textbf{1950 (dense):} 500~documents of length 200.  Each document draws a topic mixture from $\operatorname{Dir}(0.3, 0.3, 0.3)$ over T4, T5, T6.
+\end{itemize}
+
+Total: 550~documents, 105{,}000~tokens.
+The dense era contributes 20$\times$ as many tokens as the sparse era (100{,}000 vs.\ 5{,}000).
+The two eras also have genuinely different document-topic structure: the sparse era's $\operatorname{Dir}(0.1)$ concentrates each document on one or two topics, while the dense era's $\operatorname{Dir}(0.3)$ produces more diffuse mixtures.
+
+\subsection{Configuration}
+
+Both conditions use $K=6$, initial $\alpha=1$, initial $\beta=1$, up to 2{,}000~iterations, \texttt{--optimize-interval\;50} (asymmetric Minka updates every 50~iterations), and \texttt{--converge\;1e-6}.
+The weighted run additionally passes \texttt{--local-alpha} to enable per-year asymmetric $\boldsymbol\alpha(y)$ estimation, with $\sigma=10$ (years), giving sparse-era documents a weight of ${\approx}7.3$ and dense-era documents ${\approx}0.37$.
+We run 8~seeds (42, 99, 123, 200, 314, 500, 777, 1000) for each condition and keep the run with the highest final log-likelihood.
+
+\subsection{Results}
+
+Table~\ref{tab:validation} shows the percentage of each extracted topic's probability mass falling on each true topic's word group, for the best seed in each condition.
+
+\begin{table}[ht]
+\centering
+\caption{Validation: $K_{\text{true}}=6$, $K_{\text{extract}}=6$, best of 8~seeds.
+  Each row is an extracted topic; each column is the mass on a true topic's words.
+  Bold entries mark dominant assignments ($\geq99.9\%$).}
+\label{tab:validation}
+\begin{tabular}{@{}l rrrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{\makebox[0pt]{\textbf{Sparse era (1850)}}} & \multicolumn{3}{c}{\makebox[0pt]{\textbf{Dense era (1950)}}} \\
+\cmidrule(lr){2-4} \cmidrule(l){5-7}
+\textbf{Topic} & \textbf{T1} & \textbf{T2} & \textbf{T3} & \textbf{T4} & \textbf{T5} & \textbf{T6} \\
+ & \texttt{abc} & \texttt{def} & \texttt{ghi} & \texttt{ABC} & \texttt{DEF} & \texttt{GHI} \\
+\midrule
+\multicolumn{7}{@{}l}{\makebox[0pt][l]{\textit{Weighted + local $\boldsymbol\alpha$ (seed 500, LL $= -169{,}147$)}}} \\
+T0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 \\
+T1 &  0.0 & \textbf{100.0} &  0.0 &  0.0 &  0.0 &  0.0 \\
+T2 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 \\
+T3 &  0.0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 &  0.0 \\
+T4 &  0.0 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} \\
+T5 & \textbf{100.0} &  0.0 &  0.0 &  0.0 &  0.0 &  0.0 \\
+\cmidrule{1-7}
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{6/6 true topics recovered (3 sparse + 3 dense)}}} \\
+\midrule
+\multicolumn{7}{@{}l}{\makebox[0pt][l]{\textit{Unweighted (seed 99, LL $= -170{,}514$)}}} \\
+T0 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 \\
+T1 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 \\
+T2 &  0.0 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} \\
+T3 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 \\
+T4 &  0.0 & \textbf{99.9} &  0.1 &  0.0 &  0.0 &  0.0 \\
+T5 & 60.2 &  0.0 & 39.8 &  0.0 &  0.0 &  0.0 \\
+\cmidrule{1-7}
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{4/6 true topics recovered (1 sparse + 3 dense)}}} \\
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{DEF duplicated (T0, T3); abc+ghi collapsed into one blob}}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Recovered $\boldsymbol\alpha$ Vectors}
+
+The weighted + local model learns a $K$-vector $\boldsymbol\alpha(y)$ for each year.
+The asymmetric Minka estimator drives inactive topics toward $\alpha_k \approx 0$ and active topics toward their true Dirichlet concentration:
+
+\begin{center}
+\begin{tabular}{@{}l rrrrrr r@{}}
+\toprule
+\textbf{Year} & $\alpha_0$ & $\alpha_1$ & $\alpha_2$ & $\alpha_3$ & $\alpha_4$ & $\alpha_5$ & $\alpha_\Sigma$ \\
+\midrule
+1850 & 0.000 & 0.107 & 0.000 & 0.115 & 0.000 & 0.120 & 0.342 \\
+1950 & 0.302 & 0.000 & 0.270 & 0.000 & 0.282 & 0.000 & 0.854 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At 1850, only topics T1, T3, T5 (the sparse-era topics, mapped to \texttt{def}, \texttt{ghi}, \texttt{abc} respectively) have nonzero $\alpha_k$, with a sum of~$0.342 \approx 3 \times 0.1$ (the true $\operatorname{Dir}(0.1,0.1,0.1)$).
+At 1950, only topics T0, T2, T4 (the dense-era topics, mapped to \texttt{ABC}, \texttt{DEF}, \texttt{GHI}) have nonzero $\alpha_k$, with a sum of~$0.854 \approx 3 \times 0.3$ (the true $\operatorname{Dir}(0.3,0.3,0.3)$).
+The estimator correctly identifies which topics are active in each era and recovers the per-era concentration to within 15\% of the true value.
+
+\subsection{Analysis}
+
+\paragraph{Weighted model.}
+Every extracted topic places 100\% of its probability mass on a single true topic's three words.
+All six true topics---including the three from the sparse era, which contributed only 5{,}000 of the 105{,}000 tokens---are recovered perfectly.
+The density weights ($7.3\times$ for 1850, $0.37\times$ for 1950) equalise the per-era influence on the topic-word sufficient statistics, and the asymmetric $\boldsymbol\alpha$ estimator correctly learns the era-specific sparsity structure.
+Seven of the eight seeds land in the same optimum (LL~$\approx -169{,}148$); only one seed finds a different basin.
+
+\paragraph{Unweighted model.}
+All three dense-era topics are recovered, but the model \emph{duplicates} one of them: extracted topics T0 and T3 both map to \texttt{DEF}.
+One sparse-era topic (\texttt{def}) is recovered at 99.9\%, but the remaining two sparse-era topics (\texttt{abc} and \texttt{ghi}) are collapsed into a single blob (60/40\%).
+Despite having the benefit of asymmetric $\alpha$ optimisation, the unweighted model cannot overcome the 20$\times$ token imbalance: it wastes one of its six topic slots duplicating a dense-era topic rather than resolving sparse-era structure.
+The eight seeds split across two LL basins (3 seeds at ${\sim}{-}170{,}500$; 5 seeds at ${\sim}{-}173{,}060$), with the worse basin showing 0/3 sparse recovery.
+
+\paragraph{Interpretation.}
+Without weighting, the 100{,}000 dense-era tokens overwhelm the 5{,}000 sparse-era tokens in the topic-word counts.
+Even with asymmetric $\alpha$ optimisation (which represents a strictly more powerful model than standard symmetric LDA), the unweighted sampler allocates its capacity to the dense era.
+With weighting, each era's tokens carry balanced influence, and the model distributes its capacity proportionally to the number of true themes regardless of document frequency.
+
+%% ===================================================================
+\section{Underfitting Experiment ($K < K_{\text{true}}$)}
+%% ===================================================================
+
+We now ask what happens when the model is given fewer topics than truly exist.
+This is the normal situation in practice: the analyst does not know $K_{\text{true}}$ and must choose~$K$.
+
+\subsection{Setup}
+
+The corpus is identical to Appendix~A (550~documents, 105{,}000 tokens, 6~true topics, heterogeneous $\operatorname{Dir}(0.1)$/$\operatorname{Dir}(0.3)$).
+We fit $K=4$ topics, forcing the model to merge at least two pairs of true topics.
+All other settings match Appendix~A: initial $\alpha=1$, initial $\beta=1$, up to 2{,}000 iterations, \texttt{--optimize-interval\;50}, \texttt{--converge\;1e-6}, best of 8~seeds.
+
+\subsection{Results}
+
+Table~\ref{tab:underfit} shows the topic-word mass breakdown with $K=4$.
+
+\begin{table}[ht]
+\centering
+\caption{Underfitting: $K_{\text{true}}=6$, $K_{\text{extract}}=4$, best of 8~seeds.
+  Each row is an extracted topic; each column is the mass on a true topic's words.}
+\label{tab:underfit}
+\begin{tabular}{@{}l rrrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{\makebox[0pt]{\textbf{Sparse era (1850)}}} & \multicolumn{3}{c@{}}{\makebox[0pt]{\textbf{Dense era (1950)}}} \\
+\cmidrule(lr){2-4} \cmidrule(l){5-7}
+\textbf{Topic} & \textbf{T1} & \textbf{T2} & \textbf{T3} & \textbf{T4} & \textbf{T5} & \textbf{T6} \\
+ & \texttt{abc} & \texttt{def} & \texttt{ghi} & \texttt{ABC} & \texttt{DEF} & \texttt{GHI} \\
+\midrule
+\multicolumn{7}{@{}l}{\makebox[0pt][l]{\textit{Weighted + local $\boldsymbol\alpha$ (seed 200, LL $= -196{,}056$, converged iter 800)}}} \\
+T0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 &  0.0 &  0.0 \\
+T1 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 \\
+T2 &  0.0 &  0.0 &  0.0 &  0.0 & 48.9 & 51.1 \\
+T3 & 60.2 &  0.0 & 39.8 &  0.0 &  0.0 &  0.0 \\
+\cmidrule{1-7}
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{2 pure + 2 merged: balanced 2:2 split across eras}}} \\
+\midrule
+\multicolumn{7}{@{}l}{\makebox[0pt][l]{\textit{Unweighted (seed 314, LL $= -173{,}059$)}}} \\
+T0 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 \\
+T1 & 36.8 & 38.9 & 24.3 &  0.0 &  0.0 &  0.0 \\
+T2 &  0.0 &  0.0 &  0.0 &  0.0 &  0.0 & \textbf{100.0} \\
+T3 &  0.0 &  0.0 &  0.0 & \textbf{100.0} &  0.0 &  0.0 \\
+\cmidrule{1-7}
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{0 sparse + 3 dense: 3:1 split}}} \\
+\multicolumn{7}{@{}l@{}}{\makebox[0pt][l]{\textbf{Sparse era collapsed into one blob}}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Recovered $\boldsymbol\alpha$ Vectors ($K=4$)}
+
+With only 4~topics, the weighted model maps two topics to each era.
+The asymmetric estimator correctly assigns nonzero $\alpha_k$ only to the topics active in each era:
+
+\begin{center}
+\begin{tabular}{@{}l rrrr r@{}}
+\toprule
+\textbf{Year} & $\alpha_0$ & $\alpha_1$ & $\alpha_2$ & $\alpha_3$ & $\alpha_\Sigma$ \\
+\midrule
+1850 & 0.085 & 0.000 & 0.000 & 0.155 & 0.240 \\
+1950 & 0.000 & 0.300 & 0.543 & 0.000 & 0.843 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At 1850, topics T0 (\texttt{def}) and T3 (\texttt{abc+ghi}) have nonzero $\alpha_k$, summing to $0.240$.
+Since two of the three true sparse-era topics have been merged into T3, one ``slot'' of the true $\operatorname{Dir}(0.1,0.1,0.1)$ is absorbed, and the sum undershoots the true $3 \times 0.1 = 0.3$.
+At 1950, topics T1 (\texttt{ABC}) and T2 (\texttt{DEF+GHI}) sum to $0.843 \approx 3 \times 0.3$, correctly recovering the dense era's total concentration.
+The merged topic T2 absorbs two dense-era components, reflected in its larger $\alpha_2 = 0.543 \approx 2 \times 0.3$.
+
+\subsection{Analysis}
+
+With $K=4$ and $K_{\text{true}}=6$, the model must merge two pairs of true topics.
+The question is \emph{which} merges occur.
+
+\paragraph{Unweighted model.}
+All three dense-era topics are recovered purely, and all three sparse-era topics are collapsed into a single blob (37/39/24\%).
+The model devotes 3 of its 4 topics to the dense era and only 1 to the sparse era---a 3:1 split even though both eras have 3 true topics.
+All 8~seeds converge to essentially the same configuration (LL range of only ${\sim}10$), confirming a single dominant basin.
+
+\paragraph{Weighted model.}
+The merging is distributed symmetrically across both eras:
+\begin{itemize}
+\item T0 recovers \texttt{def} purely (100\%).
+\item T1 recovers \texttt{ABC} purely (100\%).
+\item T3 merges two sparse-era topics (\texttt{abc}\;+\;\texttt{ghi}, 60/40).
+\item T2 merges two dense-era topics (\texttt{DEF}\;+\;\texttt{GHI}, 49/51).
+\end{itemize}
+The model distributes its 4~topics in a 2:2 split between eras: each era gets one pure topic and one merged topic.
+The weighted model converged at iteration~800.
+The 8~seeds split across two basins---4 near LL~$\approx -197{,}000$ with the 2:2 pattern, 4 near LL~$\approx -226{,}600$ with a different merge---confirming that multi-seed selection is important for underfit models.
+
+\paragraph{Interpretation.}
+When the model is underfitting ($K < K_{\text{true}}$), it must make compromises.
+The unweighted model \emph{always} sacrifices the sparse era first because dense-era tokens dominate the likelihood.
+The weighted model spreads the compromise symmetrically: each era keeps one pure topic and surrenders one to merging.
+This is exactly the behaviour predicted by the uniform-effective-mass property (Section~5): each era exerts equal influence, so the model splits its budget proportionally rather than starving the underrepresented period.
+
+\end{document}
