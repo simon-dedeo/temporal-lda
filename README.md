@@ -4,6 +4,11 @@ A collapsed Gibbs sampler for Latent Dirichlet Allocation that weights
 topic-word counts by inverse temporal density, so sparse historical periods
 contribute equally to learned topics despite having far fewer documents.
 
+atweight.pdf containts a full description of the method, and runs some simple
+validation tests the failure modes of standard LDA in these unevenly sampled
+regimes, and shows how Temporal LDA's weighting method overcomes these issues;
+see Appendix A and B
+
 # The problems Temporal LDA solves
 
 Temporal LDA solves a key problem in the use of topic models on historical
@@ -35,24 +40,24 @@ please let me (sdedeo[at]andrew.cmu.edu) know.
 
 Temporal LDA was developed for projects stemming from the Proofs and Reasons project,
 https://proofsandreasons.io, and was supported by Grant Number 63750 from the John
-Templeton Foundation, and by the Survival and Flourishing Fund.
+Templeton Foundation, and by the Survival and Flourishing Fund. This code is released
+under CC-by-4.0; if you modify or reuse it, it's fine just to mention that fact in 
+your own version in a README.
 
-If you use Temporal LDA in your work, feel free to cite it; a good BibTeX entry
-is:
+If you use Temporal LDA in your academic work, feel free to cite it; a good BibTeX 
+entry is:
 
+```
 @misc{temporal_lda,
   author       = {DeDeo, Simon},
-  title        = {Repository Name},
+  title        = {{temporal-lda}},
   year         = {2026},
-  howpublished = {\url{https://github.com/username/repository}},
+  howpublished = {\url{https://github.com/simon-dedeo/temporal-lda}},
   note         = {Accessed: 2026-03-30}
 }
+```
 
 # Notes on the code
-
-atweight.pdf containts a full description of the method, and runs some simple
-validation tests the failure modes of standard LDA in these unevenly sampled
-regimes, and shows how Temporal LDA's weighting method overcomes these issues.
 
 THe underlying code is written in optimized C for speed; it does no preprocessing
 of the data (for, e.g., stopwords or anything else) so you will need to write
