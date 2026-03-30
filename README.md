@@ -237,9 +237,9 @@ Averaging over windows smooths out per-sample MCMC noise that would defeat
 a range-based check.  `--iterations` acts as an upper bound.
 
 Typical thresholds:
-- `1e-4` — loose, stops early
-- `1e-6` — moderate (good default)
-- `1e-8` — tight, may hit the iteration cap on small corpora
+- `1e-3` — loose, stops early
+- `1e-4` — moderate (good default)
+- `1e-6` — tight, may hit the iteration cap on small corpora
 
 ## Hyperparameter optimization
 
