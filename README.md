@@ -7,18 +7,18 @@ contribute equally to learned topics despite having far fewer documents.
 atweight.pdf containts a full description of the method, and runs some simple
 validation tests the failure modes of standard LDA in these unevenly sampled
 regimes, and shows how Temporal LDA's weighting method overcomes these issues;
-see Appendix A and B
+see Appendix A and B.
 
 # The problems Temporal LDA solves
 
 Temporal LDA solves a key problem in the use of topic models on historical
 archives: uneven sampling. If the number of documents in an archive is increasing
-as a function of time (for example), a standard topic will, in optimizing the
+as a function of time (for example), a standard topic model will, in optimizing the
 overall log-Likelihood, tend to make finer distinctions in the later period
 compared to the earlier: we overmodel (or overfit) the later, more densely-sampled
 era and undermodel (or underfit) earlier periods. 
 
-There are *ad hoc* solutions, such as simply repeating earlier documents varbatim, 
+There are *ad hoc* solutions, such as simply repeating earlier documents verbatim, 
 but these exact repeats create their own problems -- the model can, for example, 
 try to model these exact repeats using specialized topics.
 
