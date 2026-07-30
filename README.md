@@ -143,6 +143,12 @@ On the same small real-data subset, 24 OpenMP threads took 56.38 seconds and
 bound; high thread counts are primarily for the much larger production fits,
 not a promise of linear scaling.
 
+A full Commons acceptance benchmark on Orchard (786,047 documents, 558M
+tokens, K=200, 52 threads) took 101 seconds for input loading, initialization,
+and ten sweeps, and peaked at 13.6 GiB RSS. Production jobs therefore request
+16 GiB and must not be reduced below that without another measured full-corpus
+memory check.
+
 The parallel binary also reproduces the paper's validation experiments
 (atweight.pdf, Appendices A and B) on the shipped `test_data/` corpus, under
 the paper's exact protocol (8 seeds, best-of-8 by log-likelihood): weighted +
