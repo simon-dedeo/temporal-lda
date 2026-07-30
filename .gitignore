@@ -1,5 +1,10 @@
 # Compiled binary
 temporal_lda
+temporal_lda_omp
+temporal_lda_debug
+temporal_lda_asan
+temporal_lda_asan.dSYM/
+results_asan/
 
 # LaTeX build artifacts
 *.aux
