@@ -130,6 +130,23 @@ collapsed 60/40); at K=4 the weighted model splits its budget 2:2 across eras
 while the unweighted model goes 3:1 — with best-seed log-likelihoods matching
 the serial binary's optima to within 0–5 units in ~170,000.
 
+**Performance tuning.** Two further optimizations are built in: the
+per-token probability loop carries an `omp simd` reduction, and topic
+assignments are stored as uint16 rather than int (halving the hottest
+per-token memory stream; hence the K ≤ 65535 limit, checked at startup).
+For best throughput compile for your machine:
+
+```
+make omp CFLAGS="-O3 -Wall -std=c11 -march=native"
+```
+
+Measured on a 10M-token, K=200 corpus (2 threads, dual Opteron 6274):
+baseline OpenMP 1.00x -> `-march=native` 1.15x -> +simd 1.28x -> +uint16
+assignments **1.76x**. Gains compound with thread count on
+memory-bandwidth-limited machines. On multi-socket systems also try
+`numactl --interleave=all` at high thread counts (it *hurts* at low
+counts, when all threads fit one NUMA node).
+
 ## Quick start
 
 ```

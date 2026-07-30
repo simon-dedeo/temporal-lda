@@ -66,7 +66,7 @@ typedef struct {
     const char *alpha_file; /* output path for per-year alpha (NULL = don't write) */
 
     /* Gibbs sampling state */
-    int **z;           /* z[d][n] = topic assignment for token n in doc d */
+    unsigned short **z; /* z[d][n] = topic assignment (uint16; K <= 65535, checked at startup) */
 
     /* Counts:
        - n_dk is unweighted
@@ -321,9 +321,9 @@ int allocate_arrays(Model *m) {
     int K = m->num_topics;
     int V = m->vocab_size;
 
-    m->z = (int **)xcalloc((size_t)D, sizeof(int *));
+    m->z = (unsigned short **)xcalloc((size_t)D, sizeof(unsigned short *));
     for (int d = 0; d < D; d++) {
-        m->z[d] = (int *)xcalloc((size_t)m->documents[d].length, sizeof(int));
+        m->z[d] = (unsigned short *)xcalloc((size_t)m->documents[d].length, sizeof(unsigned short));
     }
 
     m->n_dk = (int *)xcalloc((size_t)D * (size_t)K, sizeof(int));
@@ -526,7 +526,7 @@ static void initialize_topics(Model *m) {
             int w = m->documents[d].word_ids[n];
             int z = (int)(rng_uniform() * K);
 
-            m->z[d][n] = z;
+            m->z[d][n] = (unsigned short)z;
             n_dk_d[z]++;                  /* unweighted */
             m->n_wk[w * K + z] += a_d;   /* weighted */
             m->n_k[z] += a_d;            /* weighted */
@@ -592,7 +592,7 @@ static void gibbs_iteration(Model *m, double *probs) {
             int *n_dk_d = n_dk_base + d * K;
             int doc_len = m->documents[d].length;
             int *word_ids = m->documents[d].word_ids;
-            int *z_d = m->z[d];
+            unsigned short *z_d = m->z[d];
 
             for (int n = 0; n < doc_len; n++) {
                 int w = word_ids[n];
@@ -605,6 +605,7 @@ static void gibbs_iteration(Model *m, double *probs) {
                 nk_delta[old_z] -= a_d;
 
                 double sum_prob = 0.0;
+                #pragma omp simd reduction(+:sum_prob)
                 for (int k = 0; k < K; k++) {
                     double p = (n_dk_d[k] + alpha_k[k]) * (n_wk_row[k] + beta) * inv_nk[k];
                     tprobs[k] = p;
@@ -622,7 +623,7 @@ static void gibbs_iteration(Model *m, double *probs) {
                     }
                 }
 
-                z_d[n] = new_z;
+                z_d[n] = (unsigned short)new_z;
                 n_dk_d[new_z]++;
                 #pragma omp atomic
                 n_wk_row[new_z] += a_d;
@@ -651,7 +652,7 @@ static void gibbs_iteration(Model *m, double *probs) {
         int *n_dk_d = n_dk_base + d * K;
         int doc_len = m->documents[d].length;
         int *word_ids = m->documents[d].word_ids;
-        int *z_d = m->z[d];
+        unsigned short *z_d = m->z[d];
 
         for (int n = 0; n < doc_len; n++) {
             int w = word_ids[n];
@@ -685,7 +686,7 @@ static void gibbs_iteration(Model *m, double *probs) {
             }
 
             /* Add token back under new topic */
-            z_d[n] = new_z;
+            z_d[n] = (unsigned short)new_z;
             n_dk_d[new_z]++;
             n_wk[w * K + new_z] += a_d;
             n_k[new_z] += a_d;
@@ -1153,6 +1154,10 @@ int main(int argc, char **argv) {
     }
 
     /* Apply model settings from CLI AFTER reading metadata */
+    if (K < 1 || K > 65535) {
+        fprintf(stderr, "Error: --K must be in [1, 65535] (topic assignments are stored as uint16)\n");
+        return 1;
+    }
     m.num_topics = K;
     m.alpha_init = alpha;
     m.beta = beta;
