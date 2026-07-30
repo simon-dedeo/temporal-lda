@@ -17,7 +17,7 @@ TARGET_ASAN := temporal_lda_asan
 SOURCES := temporal_lda.c
 HEADERS := 
 
-.PHONY: all clean run run-debug test-asan help
+.PHONY: all clean run run-debug test-asan test-repro help
 
 all: $(TARGET)
 
@@ -76,6 +76,11 @@ test-asan: $(TARGET_ASAN)
 		exit 1; \
 	fi
 
+# The OpenMP sampler promises byte-identical outputs for a fixed seed and
+# thread count. Exercise that contract explicitly.
+test-repro: omp
+	./test_reproducibility.sh ./$(TARGET_OMP)
+
 # Clean build artifacts
 clean:
 	rm -f $(TARGET) $(TARGET_OMP) $(TARGET_DEBUG) $(TARGET_ASAN)
@@ -102,4 +107,5 @@ help:
 	@echo "  make              # Build optimized binary"
 	@echo "  make run          # Run optimized version"
 	@echo "  make test-asan    # Check for memory errors"
+	@echo "  make test-repro   # Verify fixed-thread OpenMP reproducibility"
 	@echo "  make clean        # Clean everything"

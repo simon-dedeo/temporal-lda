@@ -88,18 +88,18 @@ OMP_NUM_THREADS=24 ./temporal_lda_omp --docs ... (same CLI as the serial binary)
 All parallel code is guarded by `#ifdef _OPENMP`: compiling without
 `-fopenmp` (i.e. plain `make`) produces exactly the original serial sampler.
 
-**Design.** The sweep is parallelized over documents, in the spirit of
-approximate distributed LDA (Newman et al. 2009) and Hogwild-style lock-free
-updates:
+**Design.** The sweep is parallelized over documents using a deterministic,
+synchronous AD-LDA-style update:
 
 - `n_dk` (document–topic counts) are owner-private — each document is
   touched by exactly one thread — and stay exact.
-- `n_wk` (topic–word counts) are updated with atomic adds; concurrent reads
-  are unsynchronized (Hogwild).
-- `n_k` (topic totals) accumulate in per-thread deltas folded in at the end
-  of each sweep; within a sweep, sampling uses a per-sweep snapshot of the
-  cached inverse denominators (counts go slightly stale within one sweep —
-  the standard AD-LDA approximation).
+- Global `n_wk` and `n_k` are immutable during a sweep. Each thread samples
+  against the sweep-start snapshot plus its own evolving `n_wk`/`n_k` deltas.
+- Thread-local deltas are merged in fixed thread order after the sweep. This
+  avoids concurrent read/write races and makes floating-point merge order
+  repeatable.
+- Documents use deterministic static scheduling, so a fixed thread count
+  assigns each document to the same RNG stream on every run.
 - Each thread has its own xorshift64* RNG stream, splitmix-decorrelated from
   `--seed`.
 - The per-year alpha(y) Minka update is parallelized over years (its
@@ -108,18 +108,40 @@ updates:
   and without it the alpha update dominates run time at large D).
   The log-likelihood and beta updates are parallelized with reductions.
 
-**Reproducibility.** Runs are deterministic for a fixed `--seed` *and* fixed
-thread count. Results are not bit-identical across different thread counts,
-or between the serial and parallel binaries — the difference is of the same
-kind as changing the random seed.
+**Reproducibility.** Runs are byte-for-byte deterministic for a fixed binary,
+`--seed`, thread count, input, and hardware/compiler floating-point behavior.
+`make test-repro` runs the same four-thread fit three times and compares every
+model output. Results are not expected to be identical across different thread
+counts or between serial and parallel inference, because each thread evolves a
+different local view during a sweep.
 
-**Validation.** On a 10M-token synthetic corpus (K=200, V=50k, 32-core
-machine): 7.3x sweep speedup at 24 threads; log-likelihood trajectories match
-the serial sampler to 4–5 significant figures. On a real 2M-token corpus
-(K=50, 100 iterations), the greedy-matched topic–word Jensen–Shannon
-divergence between serial and 24-thread runs (mean 0.45 bits) is *smaller*
-than between two serial runs with different seeds (0.49 bits): switching
-implementations perturbs the learned topics less than switching seeds does.
+The deterministic implementation trades memory for correctness: it allocates
+`threads * vocab_size * K * sizeof(double)` bytes for topic-word deltas. For
+K=200 and an 86k vocabulary this is about 137 MiB per thread (7.0 GiB at 52
+threads). The program prints the allocation at startup; choose a lower thread
+count when memory is constrained.
+
+**Validation.** The historical benchmark numbers below describe the former
+atomic/Hogwild implementation and are retained only as provenance. The current
+deterministic local-delta implementation must pass `make test-repro`, the paper
+protocol suite, and thread-count equivalence tests before a production binary
+is accepted. The calling project records those validation artifacts alongside
+its production provenance.
+
+Acceptance results (2026-07-30): three repeated fits were byte-identical at 4,
+24, and 52 threads. On a 1,227-document, 1.97M-token Hansard subset (K=50,
+200 iterations, three seeds), optimally matched serial-vs-OpenMP mean topic JSD
+was 0.403--0.487 bits at 1, 24, and 52 threads, below the predeclared 0.573-bit
+limit (1.25 times the median serial seed-to-seed baseline). The paper's weighted
+K=4 and K=6 recovery cases and its unweighted K=4 pathology passed. The
+non-production unweighted K=6 case recovered three semantic groups versus four
+in the serial reference, so that case is not claimed as an exact recovery pass.
+
+On the same small real-data subset, 24 OpenMP threads took 56.38 seconds and
+0.85 GiB peak RSS, versus 78.68 seconds and 0.085 GiB for the serial binary
+(1.40x wall-time speedup). The deterministic delta arrays are memory-bandwidth
+bound; high thread counts are primarily for the much larger production fits,
+not a promise of linear scaling.
 
 The parallel binary also reproduces the paper's validation experiments
 (atweight.pdf, Appendices A and B) on the shipped `test_data/` corpus, under
@@ -140,7 +162,8 @@ For best throughput compile for your machine:
 make omp CFLAGS="-O3 -Wall -std=c11 -march=native"
 ```
 
-Measured on a 10M-token, K=200 corpus (2 threads, dual Opteron 6274):
+Historical measurement on a 10M-token, K=200 corpus (2 threads, dual Opteron
+6274, former atomic implementation):
 baseline OpenMP 1.00x -> `-march=native` 1.15x -> +simd 1.28x -> +uint16
 assignments **1.76x**. Gains compound with thread count on
 memory-bandwidth-limited machines. On multi-socket systems also try

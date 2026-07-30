@@ -66,7 +66,7 @@ typedef struct {
     const char *alpha_file; /* output path for per-year alpha (NULL = don't write) */
 
     /* Gibbs sampling state */
-    unsigned short **z; /* z[d][n] = topic assignment (uint16; K <= 65535, checked at startup) */
+    uint16_t **z; /* z[d][n] = topic assignment (K <= UINT16_MAX, checked at startup) */
 
     /* Counts:
        - n_dk is unweighted
@@ -76,6 +76,16 @@ typedef struct {
     double *n_wk;      /* n_wk[w*K + k] = weighted count of word w in topic k (transposed for cache) */
     double *n_k;       /* n_k[k] = total weighted tokens in topic k */
     double *inv_nk;    /* inv_nk[k] = 1.0 / (n_k[k] + V*beta), cached inverse denominator */
+
+#ifdef _OPENMP
+    /* Deterministic AD-LDA state.  Each thread owns a complete delta against
+       the sweep-start global topic-word counts.  This costs T*V*K doubles,
+       but removes the data race in the former atomic-write/plain-read design
+       and makes fixed-seed, fixed-thread runs reproducible. */
+    double *omp_nwk_delta;
+    double *omp_nk_delta;
+    int omp_threads;
+#endif
 
     /* Document weights */
     double *weight;    /* weight[d] = effective per-token weight for doc d */
@@ -134,6 +144,7 @@ static uint64_t rng_thread_state[TLDA_MAX_THREADS];
 static int rng_threads_ready = 0;
 
 static void rng_threads_init(void) {
+    omp_set_dynamic(0);
     int T = omp_get_max_threads();
     if (T > TLDA_MAX_THREADS) T = TLDA_MAX_THREADS;
     for (int t = 0; t < T; t++) {
@@ -321,9 +332,9 @@ int allocate_arrays(Model *m) {
     int K = m->num_topics;
     int V = m->vocab_size;
 
-    m->z = (unsigned short **)xcalloc((size_t)D, sizeof(unsigned short *));
+    m->z = (uint16_t **)xcalloc((size_t)D, sizeof(uint16_t *));
     for (int d = 0; d < D; d++) {
-        m->z[d] = (unsigned short *)xcalloc((size_t)m->documents[d].length, sizeof(unsigned short));
+        m->z[d] = (uint16_t *)xcalloc((size_t)m->documents[d].length, sizeof(uint16_t));
     }
 
     m->n_dk = (int *)xcalloc((size_t)D * (size_t)K, sizeof(int));
@@ -333,6 +344,26 @@ int allocate_arrays(Model *m) {
     m->n_k = (double *)xcalloc((size_t)K, sizeof(double));
     m->inv_nk = (double *)xmalloc((size_t)K * sizeof(double));
     m->weight = (double *)xcalloc((size_t)D, sizeof(double));
+
+#ifdef _OPENMP
+    omp_set_dynamic(0);
+    m->omp_threads = omp_get_max_threads();
+    if (m->omp_threads > TLDA_MAX_THREADS) m->omp_threads = TLDA_MAX_THREADS;
+    if (m->omp_threads < 1) m->omp_threads = 1;
+    size_t nwk_cells = (size_t)V * (size_t)K;
+    if (nwk_cells > SIZE_MAX / (size_t)m->omp_threads) {
+        fprintf(stderr, "OpenMP delta allocation size overflow\n");
+        return 0;
+    }
+    m->omp_nwk_delta = (double *)xcalloc(
+        (size_t)m->omp_threads * nwk_cells, sizeof(double));
+    m->omp_nk_delta = (double *)xcalloc(
+        (size_t)m->omp_threads * (size_t)K, sizeof(double));
+    printf("[OPENMP] Deterministic local-delta sampler: %d threads, %.2f GiB delta state\n",
+           m->omp_threads,
+           ((double)m->omp_threads * (double)nwk_cells * sizeof(double)) /
+               (1024.0 * 1024.0 * 1024.0));
+#endif
 
     /* Per-year per-topic alpha array (asymmetric Dirichlet) */
     m->num_years = m->year_max - m->year_min + 1;
@@ -526,7 +557,7 @@ static void initialize_topics(Model *m) {
             int w = m->documents[d].word_ids[n];
             int z = (int)(rng_uniform() * K);
 
-            m->z[d][n] = (unsigned short)z;
+            m->z[d][n] = (uint16_t)z;
             n_dk_d[z]++;                  /* unweighted */
             m->n_wk[w * K + z] += a_d;   /* weighted */
             m->n_k[z] += a_d;            /* weighted */
@@ -565,26 +596,33 @@ static void gibbs_iteration(Model *m, double *probs) {
     int *n_dk_base = m->n_dk;
 
 #ifdef _OPENMP
-    /* Parallel sweep. Sampling uses an inv_nk snapshot taken here (counts go
-     * slightly stale within one sweep -- the AD-LDA approximation); n_wk is
-     * updated atomically (racy reads are standard Hogwild practice); n_k is
-     * reconstructed exactly at sweep end from per-thread deltas. */
+    /* Deterministic AD-LDA sweep.  Global n_wk/n_k are immutable while the
+     * parallel region runs.  Each thread samples against the global snapshot
+     * plus its own evolving deltas, then deltas are merged in fixed thread
+     * order.  schedule(static,64) gives a deterministic document-to-RNG
+     * assignment while balancing the bounded-length input documents. */
     if (!rng_threads_ready) rng_threads_init();
-    for (int k = 0; k < K; k++)
-        inv_nk[k] = 1.0 / (n_k[k] + Vbeta);
-
-    int nthreads = omp_get_max_threads();
-    if (nthreads > TLDA_MAX_THREADS) nthreads = TLDA_MAX_THREADS;
-    double *nk_delta_all = (double *)xcalloc((size_t)nthreads * (size_t)K, sizeof(double));
+    int nthreads = m->omp_threads;
+    size_t nwk_cells = (size_t)m->vocab_size * (size_t)K;
+    double *nwk_delta_all = m->omp_nwk_delta;
+    double *nk_delta_all = m->omp_nk_delta;
+    memset(nwk_delta_all, 0,
+           (size_t)nthreads * nwk_cells * sizeof(double));
+    memset(nk_delta_all, 0,
+           (size_t)nthreads * (size_t)K * sizeof(double));
 
     #pragma omp parallel num_threads(nthreads)
     {
         int tid = omp_get_thread_num();
+        double *nwk_delta = nwk_delta_all + (size_t)tid * nwk_cells;
         double *nk_delta = nk_delta_all + (size_t)tid * (size_t)K;
         double *tprobs = (double *)xmalloc((size_t)K * sizeof(double));
+        double *local_inv_nk = (double *)xmalloc((size_t)K * sizeof(double));
+        for (int k = 0; k < K; k++)
+            local_inv_nk[k] = 1.0 / (n_k[k] + Vbeta);
         uint64_t rst = rng_thread_state[tid];
 
-        #pragma omp for schedule(dynamic, 64)
+        #pragma omp for schedule(static, 64)
         for (int d = 0; d < m->num_docs; d++) {
             double a_d = m->weight[d];
             int yi = m->documents[d].year - m->year_min;
@@ -592,22 +630,26 @@ static void gibbs_iteration(Model *m, double *probs) {
             int *n_dk_d = n_dk_base + d * K;
             int doc_len = m->documents[d].length;
             int *word_ids = m->documents[d].word_ids;
-            unsigned short *z_d = m->z[d];
+            uint16_t *z_d = m->z[d];
 
             for (int n = 0; n < doc_len; n++) {
                 int w = word_ids[n];
                 int old_z = z_d[n];
                 double *n_wk_row = n_wk + (size_t)w * K;
+                double *delta_row = nwk_delta + (size_t)w * K;
 
                 n_dk_d[old_z]--;
-                #pragma omp atomic
-                n_wk_row[old_z] -= a_d;
+                delta_row[old_z] -= a_d;
                 nk_delta[old_z] -= a_d;
+                local_inv_nk[old_z] =
+                    1.0 / (n_k[old_z] + nk_delta[old_z] + Vbeta);
 
                 double sum_prob = 0.0;
                 #pragma omp simd reduction(+:sum_prob)
                 for (int k = 0; k < K; k++) {
-                    double p = (n_dk_d[k] + alpha_k[k]) * (n_wk_row[k] + beta) * inv_nk[k];
+                    double p = (n_dk_d[k] + alpha_k[k]) *
+                               (n_wk_row[k] + delta_row[k] + beta) *
+                               local_inv_nk[k];
                     tprobs[k] = p;
                     sum_prob += p;
                 }
@@ -623,25 +665,34 @@ static void gibbs_iteration(Model *m, double *probs) {
                     }
                 }
 
-                z_d[n] = (unsigned short)new_z;
+                z_d[n] = (uint16_t)new_z;
                 n_dk_d[new_z]++;
-                #pragma omp atomic
-                n_wk_row[new_z] += a_d;
+                delta_row[new_z] += a_d;
                 nk_delta[new_z] += a_d;
+                local_inv_nk[new_z] =
+                    1.0 / (n_k[new_z] + nk_delta[new_z] + Vbeta);
             }
         }
         rng_thread_state[tid] = rst;
+        free(local_inv_nk);
         free(tprobs);
     }
 
-    for (int t = 0; t < nthreads; t++) {
-        double *nk_delta = nk_delta_all + (size_t)t * (size_t)K;
-        for (int k = 0; k < K; k++)
-            n_k[k] += nk_delta[k];
+    /* Fixed merge order is part of the reproducibility contract. */
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+    for (size_t i = 0; i < nwk_cells; i++) {
+        double value = n_wk[i];
+        for (int t = 0; t < nthreads; t++)
+            value += nwk_delta_all[(size_t)t * nwk_cells + i];
+        n_wk[i] = value;
     }
-    free(nk_delta_all);
-    for (int k = 0; k < K; k++)
+    for (int k = 0; k < K; k++) {
+        double value = n_k[k];
+        for (int t = 0; t < nthreads; t++)
+            value += nk_delta_all[(size_t)t * (size_t)K + k];
+        n_k[k] = value;
         inv_nk[k] = 1.0 / (n_k[k] + Vbeta);
+    }
     return;
 #endif
 
@@ -652,7 +703,7 @@ static void gibbs_iteration(Model *m, double *probs) {
         int *n_dk_d = n_dk_base + d * K;
         int doc_len = m->documents[d].length;
         int *word_ids = m->documents[d].word_ids;
-        unsigned short *z_d = m->z[d];
+        uint16_t *z_d = m->z[d];
 
         for (int n = 0; n < doc_len; n++) {
             int w = word_ids[n];
@@ -686,7 +737,7 @@ static void gibbs_iteration(Model *m, double *probs) {
             }
 
             /* Add token back under new topic */
-            z_d[n] = (unsigned short)new_z;
+            z_d[n] = (uint16_t)new_z;
             n_dk_d[new_z]++;
             n_wk[w * K + new_z] += a_d;
             n_k[new_z] += a_d;
@@ -1024,6 +1075,10 @@ void free_model(Model *m) {
     free(m->inv_nk);
     free(m->weight);
     free(m->alpha_yk);
+#ifdef _OPENMP
+    free(m->omp_nwk_delta);
+    free(m->omp_nk_delta);
+#endif
 
     if (m->vocab) {
         for (int w = 0; w < m->vocab_size; w++) free(m->vocab[w]);
@@ -1154,7 +1209,7 @@ int main(int argc, char **argv) {
     }
 
     /* Apply model settings from CLI AFTER reading metadata */
-    if (K < 1 || K > 65535) {
+    if (K < 1 || K > UINT16_MAX) {
         fprintf(stderr, "Error: --K must be in [1, 65535] (topic assignments are stored as uint16)\n");
         return 1;
     }
