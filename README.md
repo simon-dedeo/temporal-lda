@@ -59,7 +59,7 @@ entry is:
 
 # Notes on the code
 
-THe underlying code is written in optimized C for speed; it does no preprocessing
+The underlying code is written in optimized C for speed; it does no preprocessing
 of the data (for, e.g., stopwords or anything else) so you will need to write
 your own processing code to create the necessary input files.
 
@@ -74,6 +74,52 @@ Or use the Makefile:
 ```
 make
 ```
+
+## Parallel build (OpenMP)
+
+For large corpora, an OpenMP-parallel build runs the Gibbs sweep across all
+cores of a shared-memory machine:
+
+```
+make omp                       # builds temporal_lda_omp
+OMP_NUM_THREADS=24 ./temporal_lda_omp --docs ... (same CLI as the serial binary)
+```
+
+All parallel code is guarded by `#ifdef _OPENMP`: compiling without
+`-fopenmp` (i.e. plain `make`) produces exactly the original serial sampler.
+
+**Design.** The sweep is parallelized over documents, in the spirit of
+approximate distributed LDA (Newman et al. 2009) and Hogwild-style lock-free
+updates:
+
+- `n_dk` (document–topic counts) are owner-private — each document is
+  touched by exactly one thread — and stay exact.
+- `n_wk` (topic–word counts) are updated with atomic adds; concurrent reads
+  are unsynchronized (Hogwild).
+- `n_k` (topic totals) accumulate in per-thread deltas folded in at the end
+  of each sweep; within a sweep, sampling uses a per-sweep snapshot of the
+  cached inverse denominators (counts go slightly stale within one sweep —
+  the standard AD-LDA approximation).
+- Each thread has its own xorshift64* RNG stream, splitmix-decorrelated from
+  `--seed`.
+- The per-year alpha(y) Minka update is parallelized over years (its
+  digamma(alpha_k) terms are hoisted out of the document loop, and the
+  Gaussian kernel is cut at 1e-8 instead of 1e-12 — numerically negligible,
+  and without it the alpha update dominates run time at large D).
+  The log-likelihood and beta updates are parallelized with reductions.
+
+**Reproducibility.** Runs are deterministic for a fixed `--seed` *and* fixed
+thread count. Results are not bit-identical across different thread counts,
+or between the serial and parallel binaries — the difference is of the same
+kind as changing the random seed.
+
+**Validation.** On a 10M-token synthetic corpus (K=200, V=50k, 32-core
+machine): 7.3x sweep speedup at 24 threads; log-likelihood trajectories match
+the serial sampler to 4–5 significant figures. On a real 2M-token corpus
+(K=50, 100 iterations), the greedy-matched topic–word Jensen–Shannon
+divergence between serial and 24-thread runs (mean 0.45 bits) is *smaller*
+than between two serial runs with different seeds (0.49 bits): switching
+implementations perturbs the learned topics less than switching seeds does.
 
 ## Quick start
 

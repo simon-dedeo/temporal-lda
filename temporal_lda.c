@@ -31,6 +31,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdint.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ============================================================================
    DATA STRUCTURES
@@ -122,6 +125,40 @@ static inline uint64_t rng_next(void) {
 static inline double rng_uniform(void) {
     return (rng_next() >> 11) * 0x1.0p-53;
 }
+
+#ifdef _OPENMP
+/* Per-thread xorshift64* streams, decorrelated from the global seed via
+ * splitmix64. Lazy-initialised on first parallel sweep. */
+#define TLDA_MAX_THREADS 256
+static uint64_t rng_thread_state[TLDA_MAX_THREADS];
+static int rng_threads_ready = 0;
+
+static void rng_threads_init(void) {
+    int T = omp_get_max_threads();
+    if (T > TLDA_MAX_THREADS) T = TLDA_MAX_THREADS;
+    for (int t = 0; t < T; t++) {
+        uint64_t z = rng_state + 0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1);
+        z ^= z >> 30; z *= 0xBF58476D1CE4E5B9ULL;
+        z ^= z >> 27; z *= 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        rng_thread_state[t] = z ? z : 0x123456789ABCDEFULL;
+    }
+    rng_threads_ready = 1;
+}
+
+static inline uint64_t rng_next_t(uint64_t *st) {
+    uint64_t x = *st;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *st = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+static inline double rng_uniform_t(uint64_t *st) {
+    return (rng_next_t(st) >> 11) * 0x1.0p-53;
+}
+#endif
 
 /* ============================================================================
    DIGAMMA APPROXIMATION
@@ -527,6 +564,86 @@ static void gibbs_iteration(Model *m, double *probs) {
     double *inv_nk = m->inv_nk;
     int *n_dk_base = m->n_dk;
 
+#ifdef _OPENMP
+    /* Parallel sweep. Sampling uses an inv_nk snapshot taken here (counts go
+     * slightly stale within one sweep -- the AD-LDA approximation); n_wk is
+     * updated atomically (racy reads are standard Hogwild practice); n_k is
+     * reconstructed exactly at sweep end from per-thread deltas. */
+    if (!rng_threads_ready) rng_threads_init();
+    for (int k = 0; k < K; k++)
+        inv_nk[k] = 1.0 / (n_k[k] + Vbeta);
+
+    int nthreads = omp_get_max_threads();
+    if (nthreads > TLDA_MAX_THREADS) nthreads = TLDA_MAX_THREADS;
+    double *nk_delta_all = (double *)xcalloc((size_t)nthreads * (size_t)K, sizeof(double));
+
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int tid = omp_get_thread_num();
+        double *nk_delta = nk_delta_all + (size_t)tid * (size_t)K;
+        double *tprobs = (double *)xmalloc((size_t)K * sizeof(double));
+        uint64_t rst = rng_thread_state[tid];
+
+        #pragma omp for schedule(dynamic, 64)
+        for (int d = 0; d < m->num_docs; d++) {
+            double a_d = m->weight[d];
+            int yi = m->documents[d].year - m->year_min;
+            double *alpha_k = m->alpha_yk + yi * K;
+            int *n_dk_d = n_dk_base + d * K;
+            int doc_len = m->documents[d].length;
+            int *word_ids = m->documents[d].word_ids;
+            int *z_d = m->z[d];
+
+            for (int n = 0; n < doc_len; n++) {
+                int w = word_ids[n];
+                int old_z = z_d[n];
+                double *n_wk_row = n_wk + (size_t)w * K;
+
+                n_dk_d[old_z]--;
+                #pragma omp atomic
+                n_wk_row[old_z] -= a_d;
+                nk_delta[old_z] -= a_d;
+
+                double sum_prob = 0.0;
+                for (int k = 0; k < K; k++) {
+                    double p = (n_dk_d[k] + alpha_k[k]) * (n_wk_row[k] + beta) * inv_nk[k];
+                    tprobs[k] = p;
+                    sum_prob += p;
+                }
+
+                double u = rng_uniform_t(&rst) * sum_prob;
+                double cumsum = 0.0;
+                int new_z = K - 1;
+                for (int k = 0; k < K; k++) {
+                    cumsum += tprobs[k];
+                    if (u <= cumsum) {
+                        new_z = k;
+                        break;
+                    }
+                }
+
+                z_d[n] = new_z;
+                n_dk_d[new_z]++;
+                #pragma omp atomic
+                n_wk_row[new_z] += a_d;
+                nk_delta[new_z] += a_d;
+            }
+        }
+        rng_thread_state[tid] = rst;
+        free(tprobs);
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        double *nk_delta = nk_delta_all + (size_t)t * (size_t)K;
+        for (int k = 0; k < K; k++)
+            n_k[k] += nk_delta[k];
+    }
+    free(nk_delta_all);
+    for (int k = 0; k < K; k++)
+        inv_nk[k] = 1.0 / (n_k[k] + Vbeta);
+    return;
+#endif
+
     for (int d = 0; d < m->num_docs; d++) {
         double a_d = m->weight[d];
         int yi = m->documents[d].year - m->year_min;
@@ -645,6 +762,9 @@ static void update_alpha(Model *m, int num_fp_iters) {
     double inv2s2 = 1.0 / (2.0 * sigma * sigma);
 
     for (int fp = 0; fp < num_fp_iters; fp++) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+        #endif
         for (int yi = 0; yi < Y; yi++) {
             int year = yi + m->year_min;
             double *alpha_k = m->alpha_yk + yi * K;
@@ -655,19 +775,20 @@ static void update_alpha(Model *m, int num_fp_iters) {
 
             /* Accumulate kernel-weighted per-topic numerators and shared denom */
             double numer_k[K];  /* VLA, K is small */
-            for (int k = 0; k < K; k++) numer_k[k] = 0.0;
+            double psi_ak[K];   /* hoisted digamma(alpha_k), invariant over d */
+            for (int k = 0; k < K; k++) { numer_k[k] = 0.0; psi_ak[k] = digamma(alpha_k[k]); }
             double denom = 0.0;
 
             for (int d = 0; d < D; d++) {
                 double dt = (double)(m->documents[d].year - year);
                 double kern = exp(-(dt * dt) * inv2s2);
-                if (kern < 1e-12) continue;
+                if (kern < 1e-8) continue;
 
                 int Nd = m->documents[d].length;
                 denom += kern * (digamma((double)Nd + alpha_sum) - psi_asum);
                 for (int k = 0; k < K; k++) {
                     numer_k[k] += kern * (digamma((double)m->n_dk[d * K + k] + alpha_k[k])
-                                          - digamma(alpha_k[k]));
+                                          - psi_ak[k]);
                 }
             }
 
@@ -703,6 +824,9 @@ static double update_beta(Model *m, int num_fp_iters) {
         double psi_beta  = digamma(beta_);
         double psi_Vbeta = digamma((double)V * beta_);
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) reduction(+:numer,denom)
+        #endif
         for (int k = 0; k < K; k++) {
             denom += digamma(m->n_k[k] + (double)V * beta_);
             for (int w = 0; w < V; w++) {
@@ -750,12 +874,18 @@ static double compute_log_likelihood(Model *m) {
 
     /* Precompute phi[w*K+k] = P(w|k) to avoid recomputing per token */
     double *phi = (double *)xmalloc((size_t)V * (size_t)K * sizeof(double));
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int w = 0; w < V; w++) {
         for (int k = 0; k < K; k++) {
             phi[w * K + k] = (m->n_wk[w * K + k] + beta_) / (m->n_k[k] + Vbeta);
         }
     }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 256) reduction(+:ll)
+    #endif
     for (int d = 0; d < m->num_docs; d++) {
         int yi = m->documents[d].year - m->year_min;
         double *alpha_k = m->alpha_yk + yi * K;

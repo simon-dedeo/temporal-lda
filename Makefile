@@ -9,6 +9,7 @@ LDLIBS := -lm
 
 # Targets
 TARGET := temporal_lda
+TARGET_OMP := temporal_lda_omp
 TARGET_DEBUG := temporal_lda_debug
 TARGET_ASAN := temporal_lda_asan
 
@@ -23,6 +24,12 @@ all: $(TARGET)
 $(TARGET): $(SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET) $(LDLIBS)
 	@echo "✓ Built optimized binary: $(TARGET)"
+
+# Parallel build (OpenMP). Same CLI; control threads with OMP_NUM_THREADS.
+# Requires a compiler with OpenMP support (gcc; on macOS use gcc or llvm+libomp).
+omp: $(SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) -fopenmp $(SOURCES) -o $(TARGET_OMP) $(LDLIBS)
+	@echo "✓ Built OpenMP binary: $(TARGET_OMP)"
 
 $(TARGET_DEBUG): $(SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS_DEBUG) $(SOURCES) -o $(TARGET_DEBUG) $(LDLIBS)
@@ -71,7 +78,7 @@ test-asan: $(TARGET_ASAN)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) $(TARGET_DEBUG) $(TARGET_ASAN)
+	rm -f $(TARGET) $(TARGET_OMP) $(TARGET_DEBUG) $(TARGET_ASAN)
 	rm -rf $(TARGET_ASAN).dSYM
 	@echo "✓ Cleaned build artifacts"
 
@@ -81,6 +88,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make all         - Build optimized binary (default)"
+	@echo "  make omp         - Build parallel (OpenMP) binary: $(TARGET_OMP)"
 	@echo "  make run         - Build and run optimized version with test data"
 	@echo "  make clean       - Remove build artifacts"
 	@echo ""
