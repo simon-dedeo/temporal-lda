@@ -4,10 +4,10 @@ A collapsed Gibbs sampler for Latent Dirichlet Allocation that weights
 topic-word counts by inverse temporal density, so sparse historical periods
 contribute equally to learned topics despite having far fewer documents.
 
-atweight.pdf containts a full description of the method, and runs some simple
-validation tests the failure modes of standard LDA in these unevenly sampled
-regimes, and shows how Temporal LDA's weighting method overcomes these issues;
-see Appendix A and B.
+`atweight.pdf` contains a full description of the method and simple validation
+tests of standard LDA's failure modes in unevenly sampled regimes. It also shows
+how Temporal LDA's weighting method addresses those failures; see Appendices A
+and B.
 
 # The problems Temporal LDA solves
 
@@ -85,8 +85,9 @@ make omp                       # builds temporal_lda_omp
 OMP_NUM_THREADS=24 ./temporal_lda_omp --docs ... (same CLI as the serial binary)
 ```
 
-All parallel code is guarded by `#ifdef _OPENMP`: compiling without
-`-fopenmp` (i.e. plain `make`) produces exactly the original serial sampler.
+The parallel sampling path is guarded by `#ifdef _OPENMP`: compiling without
+`-fopenmp` (that is, plain `make`) uses the serial sampling path and does not
+allocate the thread-local delta arrays.
 
 **Design.** The sweep is parallelized over documents using a deterministic,
 synchronous AD-LDA-style update:
@@ -117,9 +118,10 @@ different local view during a sweep.
 
 The deterministic implementation trades memory for correctness: it allocates
 `threads * vocab_size * K * sizeof(double)` bytes for topic-word deltas. For
-K=200 and an 86k vocabulary this is about 137 MiB per thread (7.0 GiB at 52
-threads). The program prints the allocation at startup; choose a lower thread
-count when memory is constrained.
+K=200 and an 86k vocabulary this is about 131 MiB per thread (about 6.7 GiB at
+52 threads), in addition to the shared model and corpus arrays. The program
+prints the delta allocation at startup; choose a lower thread count when memory
+is constrained.
 
 **Validation.** The historical benchmark numbers below describe the former
 atomic/Hogwild implementation and are retained only as provenance. The current
@@ -145,18 +147,18 @@ not a promise of linear scaling.
 
 A full Commons acceptance benchmark on Orchard (786,047 documents, 558M
 tokens, K=200, 52 threads) took 101 seconds for input loading, initialization,
-and ten sweeps, and peaked at 13.6 GiB RSS. Production jobs therefore request
-16 GiB and must not be reduced below that without another measured full-corpus
-memory check.
+and ten sweeps, and peaked at 13.6 GiB RSS. For that corpus, production jobs
+request 16 GiB; a lower memory request needs another measured full-corpus check.
 
-The parallel binary also reproduces the paper's validation experiments
-(atweight.pdf, Appendices A and B) on the shipped `test_data/` corpus, under
-the paper's exact protocol (8 seeds, best-of-8 by log-likelihood): weighted +
-local-alpha recovers **6/6** true topics at K=6; unweighted shows the paper's
-characteristic failure (a duplicated dense-era topic, two sparse-era topics
-collapsed 60/40); at K=4 the weighted model splits its budget 2:2 across eras
-while the unweighted model goes 3:1 — with best-seed log-likelihoods matching
-the serial binary's optima to within 0–5 units in ~170,000.
+The paper-protocol checks use the shipped `test_data/` corpus, eight seeds, and
+best-of-eight selection by log-likelihood. Weighted + local-alpha recovered all
+6 true topics at K=6 (LL -169,149 versus serial -169,147), and at K=4 both
+implementations recovered the intended 2:2 split (LL -196,057 versus serial
+-196,056). Unweighted K=4 exactly reproduced the paper's 3:1 pathology at LL
+-173,059. Unweighted K=6 did not exactly match the serial rerun: the parallel
+fit recovered three unique groups rather than four (LL -170,716 versus serial
+-170,514). That non-production comparison is retained as a disclosed limitation,
+not counted as an exact recovery pass.
 
 **Performance tuning.** Two further optimizations are built in: the
 per-token probability loop carries an `omp simd` reduction, and topic
@@ -171,10 +173,10 @@ make omp CFLAGS="-O3 -Wall -std=c11 -march=native"
 Historical measurement on a 10M-token, K=200 corpus (2 threads, dual Opteron
 6274, former atomic implementation):
 baseline OpenMP 1.00x -> `-march=native` 1.15x -> +simd 1.28x -> +uint16
-assignments **1.76x**. Gains compound with thread count on
-memory-bandwidth-limited machines. On multi-socket systems also try
-`numactl --interleave=all` at high thread counts (it *hurts* at low
-counts, when all threads fit one NUMA node).
+assignments **1.76x**. This is a historical optimization ladder, not a scaling
+guarantee for the current deterministic sampler. On multi-socket systems,
+benchmark `numactl --interleave=all` at the intended thread count; it can help
+large jobs but hurt when all threads and memory fit within one NUMA node.
 
 ## Quick start
 
@@ -367,8 +369,9 @@ Without `--local-alpha`, a single global K-vector is estimated and broadcast
 to all years.  With `--local-alpha FILE`, each year gets its own K-vector,
 kernel-weighted by temporal proximity.
 
-Starting values don't matter much — the optimizer typically converges within
-100–200 Gibbs iterations regardless of initial alpha and beta.
+On the shipped synthetic benchmark, the optimizer typically settles within
+100–200 Gibbs iterations from ordinary positive alpha and beta starting values.
+Other corpora can behave differently, so inspect the optimization trace.
 
 ### alpha.txt output format
 
