@@ -121,6 +121,15 @@ divergence between serial and 24-thread runs (mean 0.45 bits) is *smaller*
 than between two serial runs with different seeds (0.49 bits): switching
 implementations perturbs the learned topics less than switching seeds does.
 
+The parallel binary also reproduces the paper's validation experiments
+(atweight.pdf, Appendices A and B) on the shipped `test_data/` corpus, under
+the paper's exact protocol (8 seeds, best-of-8 by log-likelihood): weighted +
+local-alpha recovers **6/6** true topics at K=6; unweighted shows the paper's
+characteristic failure (a duplicated dense-era topic, two sparse-era topics
+collapsed 60/40); at K=4 the weighted model splits its budget 2:2 across eras
+while the unweighted model goes 3:1 — with best-seed log-likelihoods matching
+the serial binary's optima to within 0–5 units in ~170,000.
+
 ## Quick start
 
 ```
